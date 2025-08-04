@@ -15,13 +15,37 @@ warnings.filterwarnings("ignore")
 sns.set(style="whitegrid")
 
 # ===============================
-# 1. VADER Kurulumu
+# 1. VADER Setup with Custom Lexicon
 # ===============================
 nltk.download('vader_lexicon')
 sia = SentimentIntensityAnalyzer()
 
+# Custom English Lexicon
+custom_lexicon = {
+    # Positive words
+    "excellent": 3.0,
+    "awesome": 2.5,
+    "legendary": 2.0,
+    "superb": 2.0,
+    "verygood": 2.5,
+    "lovedit": 2.5,
+    "fantastic": 2.5,
+
+    # Negative words
+    "terrible": -3.0,
+    "disgusting": -3.0,
+    "awful": -2.5,
+    "horrible": -2.5,
+    "catastrophic": -2.5,
+    "hate": -2.5,
+    "bad": -2.0
+}
+
+# Add custom lexicon to VADER
+sia.lexicon.update(custom_lexicon)
+
 # ===============================
-# 2. Train ve Test CSV Dosyalarını Yükle
+# 2. Load Train and Test CSV
 # ===============================
 train_df = pd.read_csv("data/train.csv")
 test_df = pd.read_csv("data/test.csv")
@@ -50,20 +74,20 @@ def custom_preprocess(text):
     if pd.isna(text):
         return ""
 
-    # Küçük harfe çevir
+    # Lowercase
     text = text.lower()
 
-    # Emoji ve özel karakter temizleme
-    text = re.sub(r'[^\w\s]', '', text)  # noktalama temizle
-    text = re.sub(r'\d+', '', text)  # sayıları kaldır
+    # Remove punctuation and digits
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\d+', '', text)
 
-    # Sosyal medya jargon normalize
+    # Normalize slang
     words = text.split()
     normalized_words = [slang_dict.get(w, w) for w in words]
     return " ".join(normalized_words)
 
 
-# Eğer text_vader yoksa fallback ve preprocessing uygula
+# Apply preprocessing
 for df in [train_df, test_df]:
     if 'text_vader' in df.columns:
         df['text_vader'] = df['text_vader'].apply(custom_preprocess)
@@ -72,15 +96,15 @@ for df in [train_df, test_df]:
     elif 'text_raw' in df.columns:
         df['text_vader'] = df['text_raw'].apply(custom_preprocess)
     else:
-        raise KeyError("CSV dosyasında 'text_vader' veya alternatif sütun bulunamadı!")
+        raise KeyError("CSV file must contain 'text_vader', 'text', or 'text_raw' column!")
 
-    # text_raw fallback
+    # Ensure text_raw exists for output
     if 'text_raw' not in df.columns:
         df['text_raw'] = df['text_vader']
 
 
 # ===============================
-# 3. VADER Prediction Fonksiyonu
+# 3. VADER Prediction Function
 # ===============================
 def vader_predict(text):
     if pd.isna(text) or not str(text).strip():
@@ -102,7 +126,7 @@ train_df['vader_pred'] = train_df['text_vader'].apply(vader_predict)
 test_df['vader_pred'] = test_df['text_vader'].apply(vader_predict)
 
 # ===============================
-# 5. Performans Hesapla
+# 5. Compute Performance
 # ===============================
 train_acc = accuracy_score(train_df['sentiment'], train_df['vader_pred'])
 test_acc = accuracy_score(test_df['sentiment'], test_df['vader_pred'])
@@ -162,7 +186,7 @@ print("\n=== CONFUSION MATRIX ===")
 print(cm_df)
 
 # ===============================
-# 8. Özet Metrik Tablosu
+# 8. Overview Metrics
 # ===============================
 overview_df = pd.DataFrame([
     ["Train", train_acc, train_macro_precision, train_macro_recall, train_macro_f1, train_weighted_f1],
@@ -173,27 +197,25 @@ print("\n=== OVERVIEW METRICS ===")
 print(overview_df)
 
 # ===============================
-# 9. Sonuçları Kaydet
+# 9. Save Results
 # ===============================
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-output_dir = "results/phase1/test2"
+output_dir = "results/phase1/test3"
 os.makedirs(output_dir, exist_ok=True)
 
-# --- CSV Export ---
 train_report_df.to_csv(f"{output_dir}/vader_train_report_{timestamp}.csv")
 test_report_df.to_csv(f"{output_dir}/vader_test_report_{timestamp}.csv")
 summary_df.to_csv(f"{output_dir}/vader_class_summary_{timestamp}.csv", index=False)
 cm_df.to_csv(f"{output_dir}/vader_confusion_matrix_{timestamp}.csv")
 overview_df.to_csv(f"{output_dir}/vader_overview_metrics_{timestamp}.csv", index=False)
 
-# --- Prediction CSV ---
 output_csv = f"{output_dir}/vader_predictions_{timestamp}.csv"
 test_df[['text_raw', 'sentiment', 'vader_pred']].to_csv(output_csv, index=False)
 
 print(f"\nAll CSVs saved to '{output_dir}' folder with timestamp {timestamp}")
 
 # ===============================
-# 10. Grafikler
+# 10. Graphs
 # ===============================
 correct_counts = np.diag(cm)
 incorrect_counts = cm.sum(axis=1) - correct_counts
@@ -224,7 +246,7 @@ print(f"Graphs saved to '{output_dir}' folder with timestamp {timestamp}")
 # ===============================
 # 11. Phase Summary
 # ===============================
-phase_name = "Phase_1_1"  # Custom Preprocessing
+phase_name = "Phase_1_2"  # Custom Preprocessing
 phase_summary_file = "results/phase_summary.csv"
 
 phase_overview_df = pd.DataFrame([
