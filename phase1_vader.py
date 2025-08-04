@@ -1,11 +1,14 @@
+# ===============================
+# Phase 1.3 – Threshold Tuning
+# ===============================
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import nltk
 import re
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, f1_score, precision_score, \
-    recall_score
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from datetime import datetime
 import os
@@ -74,10 +77,7 @@ def custom_preprocess(text):
     if pd.isna(text):
         return ""
 
-    # Lowercase
     text = text.lower()
-
-    # Remove punctuation and digits
     text = re.sub(r'[^\w\s]', '', text)
     text = re.sub(r'\d+', '', text)
 
@@ -87,7 +87,6 @@ def custom_preprocess(text):
     return " ".join(normalized_words)
 
 
-# Apply preprocessing
 for df in [train_df, test_df]:
     if 'text_vader' in df.columns:
         df['text_vader'] = df['text_vader'].apply(custom_preprocess)
@@ -98,26 +97,26 @@ for df in [train_df, test_df]:
     else:
         raise KeyError("CSV file must contain 'text_vader', 'text', or 'text_raw' column!")
 
-    # Ensure text_raw exists for output
     if 'text_raw' not in df.columns:
         df['text_raw'] = df['text_vader']
 
+# ===============================
+# 3. VADER Prediction Function with Threshold Tuning
+# ===============================
+positive_threshold = 0.10
+negative_threshold = -0.10
 
-# ===============================
-# 3. VADER Prediction Function
-# ===============================
 def vader_predict(text):
     if pd.isna(text) or not str(text).strip():
         return "neutral"
     score = sia.polarity_scores(str(text))
     compound = score['compound']
-    if compound >= 0.05:
+    if compound >= positive_threshold:
         return "positive"
-    elif compound <= -0.05:
+    elif compound <= negative_threshold:
         return "negative"
     else:
         return "neutral"
-
 
 # ===============================
 # 4. Prediction
@@ -200,7 +199,7 @@ print(overview_df)
 # 9. Save Results
 # ===============================
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-output_dir = "results/phase1/test3"
+output_dir = "results/phase1/test4"  # <- Phase 1.3 output folder
 os.makedirs(output_dir, exist_ok=True)
 
 train_report_df.to_csv(f"{output_dir}/vader_train_report_{timestamp}.csv")
@@ -246,7 +245,7 @@ print(f"Graphs saved to '{output_dir}' folder with timestamp {timestamp}")
 # ===============================
 # 11. Phase Summary
 # ===============================
-phase_name = "Phase_1_2"  # Custom Preprocessing
+phase_name = "Phase_1_3_Threshold_Tuning"
 phase_summary_file = "results/phase_summary.csv"
 
 phase_overview_df = pd.DataFrame([
