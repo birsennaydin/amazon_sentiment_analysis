@@ -3,10 +3,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import nltk
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+import re
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, f1_score, precision_score, \
+    recall_score
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from datetime import datetime
 import os
+import warnings
+
+warnings.filterwarnings("ignore")
+sns.set(style="whitegrid")
 
 # ===============================
 # 1. VADER Kurulumu
@@ -24,6 +30,56 @@ print("Train:", train_df.shape, "Test:", test_df.shape)
 print(train_df['sentiment'].value_counts())
 
 # ===============================
+# 2.1 Custom Preprocessing
+# ===============================
+slang_dict = {
+    "u": "you",
+    "ur": "your",
+    "idk": "i don't know",
+    "omg": "oh my god",
+    "lol": "laughing out loud",
+    "lmao": "laughing my ass off",
+    "wtf": "what the fuck",
+    "btw": "by the way",
+    "imo": "in my opinion",
+    "imho": "in my humble opinion"
+}
+
+
+def custom_preprocess(text):
+    if pd.isna(text):
+        return ""
+
+    # Küçük harfe çevir
+    text = text.lower()
+
+    # Emoji ve özel karakter temizleme
+    text = re.sub(r'[^\w\s]', '', text)  # noktalama temizle
+    text = re.sub(r'\d+', '', text)  # sayıları kaldır
+
+    # Sosyal medya jargon normalize
+    words = text.split()
+    normalized_words = [slang_dict.get(w, w) for w in words]
+    return " ".join(normalized_words)
+
+
+# Eğer text_vader yoksa fallback ve preprocessing uygula
+for df in [train_df, test_df]:
+    if 'text_vader' in df.columns:
+        df['text_vader'] = df['text_vader'].apply(custom_preprocess)
+    elif 'text' in df.columns:
+        df['text_vader'] = df['text'].apply(custom_preprocess)
+    elif 'text_raw' in df.columns:
+        df['text_vader'] = df['text_raw'].apply(custom_preprocess)
+    else:
+        raise KeyError("CSV dosyasında 'text_vader' veya alternatif sütun bulunamadı!")
+
+    # text_raw fallback
+    if 'text_raw' not in df.columns:
+        df['text_raw'] = df['text_vader']
+
+
+# ===============================
 # 3. VADER Prediction Fonksiyonu
 # ===============================
 def vader_predict(text):
@@ -37,6 +93,7 @@ def vader_predict(text):
         return "negative"
     else:
         return "neutral"
+
 
 # ===============================
 # 4. Prediction
@@ -79,16 +136,16 @@ print(test_report_df)
 # 6. Class-level Summary
 # ===============================
 summary_list = []
-for label in ["negative","neutral","positive"]:
+for label in ["negative", "neutral", "positive"]:
     total = len(test_df[test_df['sentiment'] == label])
     correct = np.sum((test_df['sentiment'] == label) & (test_df['vader_pred'] == label))
-    summary_list.append([label, total, correct, correct/total if total>0 else 0])
+    summary_list.append([label, total, correct, correct / total if total > 0 else 0])
 
-summary_df = pd.DataFrame(summary_list, columns=['class','total','correct','accuracy_per_class'])
+summary_df = pd.DataFrame(summary_list, columns=['class', 'total', 'correct', 'accuracy_per_class'])
 summary_df.loc[len(summary_df)] = [
     "TOTAL",
     len(test_df),
-    np.sum(test_df['sentiment']==test_df['vader_pred']),
+    np.sum(test_df['sentiment'] == test_df['vader_pred']),
     accuracy_score(test_df['sentiment'], test_df['vader_pred'])
 ]
 
@@ -98,7 +155,7 @@ print(summary_df)
 # ===============================
 # 7. Confusion Matrix
 # ===============================
-labels = ["negative","neutral","positive"]
+labels = ["negative", "neutral", "positive"]
 cm = confusion_matrix(test_df['sentiment'], test_df['vader_pred'], labels=labels)
 cm_df = pd.DataFrame(cm, index=labels, columns=labels)
 print("\n=== CONFUSION MATRIX ===")
@@ -119,20 +176,21 @@ print(overview_df)
 # 9. Sonuçları Kaydet
 # ===============================
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-os.makedirs("results/phase1/test1", exist_ok=True)
+output_dir = "results/phase1/test2"
+os.makedirs(output_dir, exist_ok=True)
 
 # --- CSV Export ---
-train_report_df.to_csv(f"results/phase1/test1/vader_train_report_{timestamp}.csv")
-test_report_df.to_csv(f"results/phase1/test1/vader_test_report_{timestamp}.csv")
-summary_df.to_csv(f"results/phase1/test1/vader_class_summary_{timestamp}.csv", index=False)
-cm_df.to_csv(f"results/phase1/test1/vader_confusion_matrix_{timestamp}.csv")
-overview_df.to_csv(f"results/phase1/test1/vader_overview_metrics_{timestamp}.csv", index=False)
+train_report_df.to_csv(f"{output_dir}/vader_train_report_{timestamp}.csv")
+test_report_df.to_csv(f"{output_dir}/vader_test_report_{timestamp}.csv")
+summary_df.to_csv(f"{output_dir}/vader_class_summary_{timestamp}.csv", index=False)
+cm_df.to_csv(f"{output_dir}/vader_confusion_matrix_{timestamp}.csv")
+overview_df.to_csv(f"{output_dir}/vader_overview_metrics_{timestamp}.csv", index=False)
 
 # --- Prediction CSV ---
-output_csv = f"results/phase1/test1/vader_predictions_{timestamp}.csv"
+output_csv = f"{output_dir}/vader_predictions_{timestamp}.csv"
 test_df[['text_raw', 'sentiment', 'vader_pred']].to_csv(output_csv, index=False)
 
-print(f"\nAll CSVs saved to 'results/phase1/test1/' folder with timestamp {timestamp}")
+print(f"\nAll CSVs saved to '{output_dir}' folder with timestamp {timestamp}")
 
 # ===============================
 # 10. Grafikler
@@ -141,32 +199,32 @@ correct_counts = np.diag(cm)
 incorrect_counts = cm.sum(axis=1) - correct_counts
 x = np.arange(len(labels))
 
-plt.figure(figsize=(8,5))
-plt.bar(x-0.2, correct_counts, width=0.4, label="Correct", color="#4CAF50")
-plt.bar(x+0.2, incorrect_counts, width=0.4, label="Incorrect", color="#F44336")
+plt.figure(figsize=(8, 5))
+plt.bar(x - 0.2, correct_counts, width=0.4, label="Correct", color="#4CAF50")
+plt.bar(x + 0.2, incorrect_counts, width=0.4, label="Incorrect", color="#F44336")
 plt.xticks(x, labels)
 plt.title("Correct vs Incorrect Predictions per Class")
 plt.ylabel("Count")
 plt.legend()
 plt.tight_layout()
-plt.savefig(f"results/phase1/test1/vader_correct_incorrect_{timestamp}.png")
+plt.savefig(f"{output_dir}/vader_correct_incorrect_{timestamp}.png")
 plt.close()
 
-plt.figure(figsize=(6,5))
+plt.figure(figsize=(6, 5))
 sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels)
 plt.title("Confusion Matrix")
 plt.ylabel("True")
 plt.xlabel("Predicted")
 plt.tight_layout()
-plt.savefig(f"results/phase1/test1/vader_confusion_matrix_{timestamp}.png")
+plt.savefig(f"{output_dir}/vader_confusion_matrix_{timestamp}.png")
 plt.close()
 
-print(f"Graphs saved to 'results/phase1/test1/' folder with timestamp {timestamp}")
+print(f"Graphs saved to '{output_dir}' folder with timestamp {timestamp}")
 
 # ===============================
 # 11. Phase Summary
 # ===============================
-phase_name = "Phase_1_0"  # Burayı her fazda güncelle
+phase_name = "Phase_1_1"  # Custom Preprocessing
 phase_summary_file = "results/phase_summary.csv"
 
 phase_overview_df = pd.DataFrame([
