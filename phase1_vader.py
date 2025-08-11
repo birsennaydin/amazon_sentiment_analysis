@@ -1,5 +1,5 @@
 # ===============================
-# Phase 1.3 – Threshold Tuning
+# Phase 1.4 – Threshold Optimization (Grid Search)
 # ===============================
 
 import pandas as pd
@@ -23,28 +23,12 @@ sns.set(style="whitegrid")
 nltk.download('vader_lexicon')
 sia = SentimentIntensityAnalyzer()
 
-# Custom English Lexicon
 custom_lexicon = {
-    # Positive words
-    "excellent": 3.0,
-    "awesome": 2.5,
-    "legendary": 2.0,
-    "superb": 2.0,
-    "verygood": 2.5,
-    "lovedit": 2.5,
-    "fantastic": 2.5,
-
-    # Negative words
-    "terrible": -3.0,
-    "disgusting": -3.0,
-    "awful": -2.5,
-    "horrible": -2.5,
-    "catastrophic": -2.5,
-    "hate": -2.5,
-    "bad": -2.0
+    "excellent": 3.0, "awesome": 2.5, "legendary": 2.0, "superb": 2.0,
+    "verygood": 2.5, "lovedit": 2.5, "fantastic": 2.5,
+    "terrible": -3.0, "disgusting": -3.0, "awful": -2.5, "horrible": -2.5,
+    "catastrophic": -2.5, "hate": -2.5, "bad": -2.0
 }
-
-# Add custom lexicon to VADER
 sia.lexicon.update(custom_lexicon)
 
 # ===============================
@@ -52,40 +36,27 @@ sia.lexicon.update(custom_lexicon)
 # ===============================
 train_df = pd.read_csv("data/train.csv")
 test_df = pd.read_csv("data/test.csv")
-
 print("Train:", train_df.shape, "Test:", test_df.shape)
-print(train_df['sentiment'].value_counts())
 
 # ===============================
-# 2.1 Custom Preprocessing
+# 2.1 Preprocessing
 # ===============================
 slang_dict = {
-    "u": "you",
-    "ur": "your",
-    "idk": "i don't know",
-    "omg": "oh my god",
-    "lol": "laughing out loud",
-    "lmao": "laughing my ass off",
-    "wtf": "what the fuck",
-    "btw": "by the way",
-    "imo": "in my opinion",
+    "u": "you", "ur": "your", "idk": "i don't know", "omg": "oh my god",
+    "lol": "laughing out loud", "lmao": "laughing my ass off",
+    "wtf": "what the fuck", "btw": "by the way", "imo": "in my opinion",
     "imho": "in my humble opinion"
 }
-
 
 def custom_preprocess(text):
     if pd.isna(text):
         return ""
-
     text = text.lower()
     text = re.sub(r'[^\w\s]', '', text)
     text = re.sub(r'\d+', '', text)
-
-    # Normalize slang
     words = text.split()
     normalized_words = [slang_dict.get(w, w) for w in words]
     return " ".join(normalized_words)
-
 
 for df in [train_df, test_df]:
     if 'text_vader' in df.columns:
@@ -95,42 +66,59 @@ for df in [train_df, test_df]:
     elif 'text_raw' in df.columns:
         df['text_vader'] = df['text_raw'].apply(custom_preprocess)
     else:
-        raise KeyError("CSV file must contain 'text_vader', 'text', or 'text_raw' column!")
+        raise KeyError("CSV must have 'text_vader', 'text', or 'text_raw' column!")
 
     if 'text_raw' not in df.columns:
         df['text_raw'] = df['text_vader']
 
 # ===============================
-# 3. VADER Prediction Function with Threshold Tuning
+# 3. VADER Prediction Function
 # ===============================
-positive_threshold = 0.10
-negative_threshold = -0.10
-
-def vader_predict(text):
+def vader_predict(text, pos_th, neg_th):
     if pd.isna(text) or not str(text).strip():
         return "neutral"
     score = sia.polarity_scores(str(text))
     compound = score['compound']
-    if compound >= positive_threshold:
+    if compound >= pos_th:
         return "positive"
-    elif compound <= negative_threshold:
+    elif compound <= neg_th:
         return "negative"
     else:
         return "neutral"
 
 # ===============================
-# 4. Prediction
+# 4. Grid Search for Best Thresholds
 # ===============================
-train_df['vader_pred'] = train_df['text_vader'].apply(vader_predict)
-test_df['vader_pred'] = test_df['text_vader'].apply(vader_predict)
+def grid_search_best_threshold(df, true_col, text_col):
+    best_f1 = -1
+    best_pos, best_neg = 0, 0
+
+    thresholds = np.arange(0.05, 0.55, 0.05)  # Search range
+    for pos_th in thresholds:
+        for neg_th in -thresholds[::-1]:  # e.g., -0.05 to -0.5
+            preds = df[text_col].apply(lambda x: vader_predict(x, pos_th, neg_th))
+            macro_f1 = f1_score(df[true_col], preds, average='macro')
+            if macro_f1 > best_f1:
+                best_f1 = macro_f1
+                best_pos, best_neg = pos_th, neg_th
+
+    return best_pos, best_neg, best_f1
+
+best_pos, best_neg, best_f1 = grid_search_best_threshold(train_df, 'sentiment', 'text_vader')
+print(f"\nBest Thresholds: positive >= {best_pos:.2f}, negative <= {best_neg:.2f} (Train Macro F1: {best_f1:.4f})")
 
 # ===============================
-# 5. Compute Performance
+# 5. Final Predictions with Best Threshold
+# ===============================
+train_df['vader_pred'] = train_df['text_vader'].apply(lambda x: vader_predict(x, best_pos, best_neg))
+test_df['vader_pred'] = test_df['text_vader'].apply(lambda x: vader_predict(x, best_pos, best_neg))
+
+# ===============================
+# 6. Compute Performance
 # ===============================
 train_acc = accuracy_score(train_df['sentiment'], train_df['vader_pred'])
 test_acc = accuracy_score(test_df['sentiment'], test_df['vader_pred'])
 
-# Precision, Recall, F1
 train_macro_precision = precision_score(train_df['sentiment'], train_df['vader_pred'], average='macro', zero_division=0)
 train_macro_recall = recall_score(train_df['sentiment'], train_df['vader_pred'], average='macro', zero_division=0)
 train_macro_f1 = f1_score(train_df['sentiment'], train_df['vader_pred'], average='macro')
@@ -156,7 +144,7 @@ print(f"Accuracy: {test_acc:.4f}")
 print(test_report_df)
 
 # ===============================
-# 6. Class-level Summary
+# 7. Class-level Summary
 # ===============================
 summary_list = []
 for label in ["negative", "neutral", "positive"]:
@@ -176,7 +164,7 @@ print("\n=== SUMMARY TABLE ===")
 print(summary_df)
 
 # ===============================
-# 7. Confusion Matrix
+# 8. Confusion Matrix
 # ===============================
 labels = ["negative", "neutral", "positive"]
 cm = confusion_matrix(test_df['sentiment'], test_df['vader_pred'], labels=labels)
@@ -185,7 +173,7 @@ print("\n=== CONFUSION MATRIX ===")
 print(cm_df)
 
 # ===============================
-# 8. Overview Metrics
+# 9. Overview Metrics
 # ===============================
 overview_df = pd.DataFrame([
     ["Train", train_acc, train_macro_precision, train_macro_recall, train_macro_f1, train_weighted_f1],
@@ -196,10 +184,10 @@ print("\n=== OVERVIEW METRICS ===")
 print(overview_df)
 
 # ===============================
-# 9. Save Results
+# 10. Save Results
 # ===============================
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-output_dir = "results/phase1/test4"  # <- Phase 1.3 output folder
+output_dir = "results/phase1/test5"  # <- Phase 1.4 output folder
 os.makedirs(output_dir, exist_ok=True)
 
 train_report_df.to_csv(f"{output_dir}/vader_train_report_{timestamp}.csv")
@@ -214,7 +202,7 @@ test_df[['text_raw', 'sentiment', 'vader_pred']].to_csv(output_csv, index=False)
 print(f"\nAll CSVs saved to '{output_dir}' folder with timestamp {timestamp}")
 
 # ===============================
-# 10. Graphs
+# 11. Graphs
 # ===============================
 correct_counts = np.diag(cm)
 incorrect_counts = cm.sum(axis=1) - correct_counts
@@ -243,9 +231,9 @@ plt.close()
 print(f"Graphs saved to '{output_dir}' folder with timestamp {timestamp}")
 
 # ===============================
-# 11. Phase Summary
+# 12. Phase Summary
 # ===============================
-phase_name = "Phase_1_3_Threshold_Tuning"
+phase_name = "Phase_1_4_Threshold_Optimization"
 phase_summary_file = "results/phase_summary.csv"
 
 phase_overview_df = pd.DataFrame([
