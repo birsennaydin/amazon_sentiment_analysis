@@ -1,320 +1,204 @@
-# phase2_bert.py
-# Phase 2.0 — Baseline BERT (Frozen encoder, feature-based)
-# - Extract [CLS] embeddings with bert-base-uncased (no domain fine-tuning)
-# - Train Logistic Regression on top of frozen embeddings
-# - Save reports/CSVs/graphs mirroring Phase 1 (VADER)
+import sys
+print(sys.modules.get("transformers"))
+import transformers
+print("Transformers version (runtime):", transformers.__version__)
+from transformers import TrainingArguments
+print("TrainingArguments source:", TrainingArguments.__module__)
+import inspect
+print("TrainingArguments file:", inspect.getfile(TrainingArguments))
 
 import os
-import re
-import json
-import time
-import math
-import random
-import argparse
-from datetime import datetime
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import time
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
+import matplotlib.pyplot as plt
 
-from transformers import AutoTokenizer, AutoModel
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    classification_report, confusion_matrix
+from transformers import (
+    BertTokenizerFast, BertForSequenceClassification,
+    Trainer, set_seed
 )
 
-import matplotlib.pyplot as plt
-import seaborn as sns
+# -----------------------------
+# 0) Çıkış klasörü ve tohum
+# -----------------------------
+STAMP = time.strftime("%Y%m%d_%H%M%S")
+OUT_DIR = Path(f"results/phase2/phase2_1_domain_finetune/{STAMP}")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-RANDOM_SEED = 42
-np.random.seed(RANDOM_SEED)
-random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-torch.cuda.manual_seed_all(RANDOM_SEED)
+set_seed(42)
+print(f"[Phase 2.1] Output -> {OUT_DIR}")
 
 # -----------------------------
-# Config
+# 1) Veriyi yükle
 # -----------------------------
-MODEL_NAME = "bert-base-uncased"
-MAX_LENGTH = 128
-BATCH_SIZE = 64
-NUM_WORKERS = 2
+CSV_PATH = "data/amazon_electronics_prepared.csv"
+df = pd.read_csv(CSV_PATH)
 
-LABEL_ORDER = ["negative", "neutral", "positive"]
-LABEL2ID = {l:i for i, l in enumerate(LABEL_ORDER)}
-ID2LABEL = {i:l for l,i in LABEL2ID.items()}
+assert "text_bert" in df.columns and "sentiment" in df.columns, \
+    "CSV içinde 'text_bert' ve 'sentiment' kolonları olmalı."
 
-# -----------------------------
-# Utils
-# -----------------------------
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-def timestamped_outdir(phase_stub: str):
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    outdir = os.path.join("results", "phase2", phase_stub, ts)
-    ensure_dir(outdir)
-    return outdir, ts
-
-def load_splits():
-    train_df = pd.read_csv("data/train.csv")
-    val_df   = pd.read_csv("data/val.csv")
-    test_df  = pd.read_csv("data/test.csv")
-    return train_df, val_df, test_df
-
-def prepare_text_and_labels(df: pd.DataFrame, text_col="text_bert", label_col="sentiment"):
-    if text_col not in df.columns:
-        # fallback
-        text_col = "text_raw" if "text_raw" in df.columns else df.columns[0]
-    texts = df[text_col].astype(str).fillna("").tolist()
-    labels = df[label_col].astype(str).tolist()
-    y = np.array([LABEL2ID[l] for l in labels])
-    return texts, y
+label2id = {"positive": 0, "neutral": 1, "negative": 2}
+id2label = {v: k for k, v in label2id.items()}
+df = df[df["sentiment"].isin(label2id.keys())].copy()
+df["label"] = df["sentiment"].map(label2id)
 
 # -----------------------------
-# Dataset for embedding extraction
+# 2) Stratified bölme
 # -----------------------------
-class TextDataset(Dataset):
-    def __init__(self, texts, tokenizer, max_length=128):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+X_train, X_temp, y_train, y_temp = train_test_split(
+    df["text_bert"], df["label"],
+    test_size=0.30, stratify=df["label"], random_state=42
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp,
+    test_size=0.50, stratify=y_temp, random_state=42
+)
 
+print(f"Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
+
+# -----------------------------
+# 3) Tokenizer ve encode
+# -----------------------------
+MAX_LEN = 128
+tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
+def encode_texts(texts: List[str]):
+    return tokenizer(
+        list(texts),
+        truncation=True,
+        padding=True,
+        max_length=MAX_LEN
+    )
+
+enc_train = encode_texts(X_train)
+enc_val   = encode_texts(X_val)
+enc_test  = encode_texts(X_test)
+
+@dataclass
+class HFDataset(torch.utils.data.Dataset):
+    encodings: Dict[str, List[int]]
+    labels: List[int]
     def __len__(self):
-        return len(self.texts)
-
+        return len(self.labels)
     def __getitem__(self, idx):
-        t = self.texts[idx]
-        enc = self.tokenizer(
-            t,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        # squeeze batch dim
-        item = {k: v.squeeze(0) for k, v in enc.items()}
+        item = {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx])
         return item
 
-# -----------------------------
-# Embedding extraction ([CLS])
-# -----------------------------
-@torch.no_grad()
-def extract_cls_embeddings(texts, tokenizer, model, device):
-    ds = TextDataset(texts, tokenizer, MAX_LENGTH)
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-    reps = []
-    model.eval()
-    for batch in tqdm(dl, desc="Embedding"):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(**batch)
-        # last_hidden_state: (bs, seq_len, hidden)
-        # [CLS] token is position 0
-        cls_vec = outputs.last_hidden_state[:, 0, :]  # (bs, hidden)
-        reps.append(cls_vec.cpu().numpy())
-    reps = np.vstack(reps)
-    return reps  # shape: (N, hidden_size)
+train_ds = HFDataset(enc_train, list(y_train))
+val_ds   = HFDataset(enc_val,   list(y_val))
+test_ds  = HFDataset(enc_test,  list(y_test))
 
 # -----------------------------
-# Metrics & reporting
+# 4) Model
 # -----------------------------
-def compute_overview_metrics(y_true, y_pred):
-    return {
-        "Accuracy": accuracy_score(y_true, y_pred),
-        "Macro_Precision": precision_score(y_true, y_pred, average="macro", zero_division=0),
-        "Macro_Recall": recall_score(y_true, y_pred, average="macro", zero_division=0),
-        "Macro_F1": f1_score(y_true, y_pred, average="macro"),
-        "Weighted_F1": f1_score(y_true, y_pred, average="weighted")
-    }
-
-def class_summary(y_true, y_pred):
-    labels = list(range(len(LABEL_ORDER)))
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-    rows = []
-    for i, lab in enumerate(LABEL_ORDER):
-        total = cm[i].sum()
-        correct = cm[i, i]
-        acc_cls = correct / total if total > 0 else 0.0
-        rows.append([lab, int(total), int(correct), acc_cls])
-    rows.append([
-        "TOTAL", int(cm.sum()), int((y_true == y_pred).sum()),
-        accuracy_score(y_true, y_pred)
-    ])
-    return cm, pd.DataFrame(rows, columns=["Class", "Total", "Correct", "Accuracy per Class"])
-
-def save_reports(outdir, split_name, y_true, y_pred, proba=None):
-    # Overview metrics
-    ov = compute_overview_metrics(y_true, y_pred)
-    ov_df = pd.DataFrame([[split_name, *ov.values()]],
-                         columns=["Dataset", "Accuracy", "Macro_Precision", "Macro_Recall", "Macro_F1", "Weighted_F1"])
-    ov_path = os.path.join(outdir, f"bert_overview_metrics_{split_name}.csv")
-    ov_df.to_csv(ov_path, index=False)
-
-    # Classification report
-    cr = classification_report(y_true, y_pred, target_names=LABEL_ORDER, output_dict=True, digits=4)
-    cr_df = pd.DataFrame(cr).transpose()
-    cr_path = os.path.join(outdir, f"bert_{split_name}_report.csv")
-    cr_df.to_csv(cr_path)
-
-    # Class summary + confusion matrix
-    cm, cs_df = class_summary(y_true, y_pred)
-    cs_path = os.path.join(outdir, f"bert_class_summary_{split_name}.csv")
-    cs_df.to_csv(cs_path, index=False)
-
-    cm_df = pd.DataFrame(cm, index=LABEL_ORDER, columns=LABEL_ORDER)
-    cm_path = os.path.join(outdir, f"bert_confusion_matrix_{split_name}.csv")
-    cm_df.to_csv(cm_path)
-
-    # Predictions CSV (optionally with probabilities)
-    pred_labels = [ID2LABEL[i] for i in y_pred]
-    pred_df = pd.DataFrame({"true": [ID2LABEL[i] for i in y_true], "pred": pred_labels})
-    if proba is not None:
-        for i, lab in enumerate(LABEL_ORDER):
-            pred_df[f"proba_{lab}"] = proba[:, i]
-    pred_path = os.path.join(outdir, f"bert_predictions_{split_name}.csv")
-    pred_df.to_csv(pred_path, index=False)
-
-    # Graphs
-    # 1) Confusion matrix heatmap
-    plt.figure(figsize=(6,5))
-    sns.heatmap(cm_df, annot=True, fmt="d", cmap="Blues", xticklabels=LABEL_ORDER, yticklabels=LABEL_ORDER)
-    plt.title(f"Confusion Matrix – BERT ({split_name})")
-    plt.ylabel("True")
-    plt.xlabel("Predicted")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"bert_confusion_matrix_{split_name}.png"), dpi=300)
-    plt.close()
-
-    # 2) Correct vs Incorrect per class
-    correct_counts = np.diag(cm)
-    incorrect_counts = cm.sum(axis=1) - correct_counts
-    x = np.arange(len(LABEL_ORDER))
-    plt.figure(figsize=(8,5))
-    plt.bar(x - 0.2, correct_counts, width=0.4, label="Correct")
-    plt.bar(x + 0.2, incorrect_counts, width=0.4, label="Incorrect")
-    plt.xticks(x, LABEL_ORDER)
-    plt.title(f"Correct vs Incorrect per Class – BERT ({split_name})")
-    plt.ylabel("Count")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, f"bert_correct_incorrect_{split_name}.png"), dpi=300)
-    plt.close()
-
-    return ov_df, cr_df, cs_df, cm_df
+model = BertForSequenceClassification.from_pretrained(
+    "bert-base-uncased",
+    num_labels=3,
+    id2label=id2label,
+    label2id=label2id
+)
 
 # -----------------------------
-# Phase 2.0 – Baseline (Frozen Encoder)
+# 5) Metrikler
 # -----------------------------
-def run_phase_20_baseline(device="cuda" if torch.cuda.is_available() else "cpu"):
-    outdir, ts = timestamped_outdir("phase2_0_baseline")
-    print(f"[Phase 2.0] Output -> {outdir}")
-
-    # Load data
-    train_df, val_df, test_df = load_splits()
-    X_train, y_train = prepare_text_and_labels(train_df, text_col="text_bert")
-    X_val,   y_val   = prepare_text_and_labels(val_df,   text_col="text_bert")
-    X_test,  y_test  = prepare_text_and_labels(test_df,  text_col="text_bert")
-
-    # Load tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModel.from_pretrained(MODEL_NAME).to(device)
-
-    # Extract [CLS] embeddings (frozen encoder)
-    print("Extracting embeddings (train)...")
-    train_reps = extract_cls_embeddings(X_train, tokenizer, model, device)
-    print("Extracting embeddings (val)...")
-    val_reps   = extract_cls_embeddings(X_val, tokenizer, model, device)
-    print("Extracting embeddings (test)...")
-    test_reps  = extract_cls_embeddings(X_test, tokenizer, model, device)
-
-    # Train linear classifier
-    clf = LogisticRegression(
-        max_iter=1000,
-        multi_class="multinomial",
-        solver="lbfgs",
-        n_jobs=-1,
-        random_state=RANDOM_SEED
+def compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    acc = accuracy_score(labels, preds)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        labels, preds, average="macro", zero_division=0
     )
-    clf.fit(train_reps, y_train)
-
-    # Evaluate
-    y_train_pred = clf.predict(train_reps)
-    y_val_pred   = clf.predict(val_reps)
-    y_test_pred  = clf.predict(test_reps)
-
-    # Predict probabilities (for CSV)
-    train_proba = clf.predict_proba(train_reps)
-    val_proba   = clf.predict_proba(val_reps)
-    test_proba  = clf.predict_proba(test_reps)
-
-    # Save reports
-    train_ov, train_cr, train_cs, train_cm = save_reports(outdir, "train", y_train, y_train_pred, train_proba)
-    val_ov,   val_cr,   val_cs,   val_cm   = save_reports(outdir, "val",   y_val,   y_val_pred,   val_proba)
-    test_ov,  test_cr,  test_cs,  test_cm  = save_reports(outdir, "test",  y_test,  y_test_pred,  test_proba)
-
-    # Phase summary (append)
-    phase_name = "Phase_2_0_Baseline_FrozenBERT"
-    phase_summary_file = "results/phase_summary.csv"
-    phase_overview_df = pd.DataFrame([
-        [phase_name, "Train", *train_ov.iloc[0,1:].tolist()],
-        [phase_name, "Val",   *val_ov.iloc[0,1:].tolist()],
-        [phase_name, "Test",  *test_ov.iloc[0,1:].tolist()],
-    ], columns=["Phase", "Dataset", "Accuracy", "Macro_Precision", "Macro_Recall", "Macro_F1", "Weighted_F1"])
-
-    if os.path.exists(phase_summary_file):
-        old_df = pd.read_csv(phase_summary_file)
-        combined_df = pd.concat([old_df, phase_overview_df], ignore_index=True)
-        combined_df.to_csv(phase_summary_file, index=False)
-    else:
-        phase_overview_df.to_csv(phase_summary_file, index=False)
-
-    print(f"[Phase 2.0] Done. Outputs saved under: {outdir}")
+    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
 
 # -----------------------------
-# Stubs for next phases (to be implemented)
+# 6) TrainingArguments & Trainer
 # -----------------------------
-def run_phase_21_finetune():
-    """
-    Phase 2.1 — Domain-Adaptive Fine-Tuning
-    - To be implemented: full fine-tuning with HuggingFace Trainer on train set, eval on val/test
-    - Save metrics/CSVs/plots mirroring Phase 1 & Phase 2.0
-    """
-    raise NotImplementedError("Phase 2.1 not implemented yet.")
+use_fp16 = torch.cuda.is_available()
 
-def run_phase_22_kfold():
-    """
-    Phase 2.2 — K-Fold Cross Validation (e.g., 5-fold)
-    - To be implemented: repeat fine-tuning across folds, average metrics
-    """
-    raise NotImplementedError("Phase 2.2 not implemented yet.")
+args = TrainingArguments(
+    output_dir=str(OUT_DIR / "checkpoints"),
+    num_train_epochs=4,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=32,
+    learning_rate=2e-5,
+    weight_decay=0.01,
+    warmup_ratio=0.06,
+    logging_dir=str(OUT_DIR / "logs"),
+    logging_steps=50,
+    eval_strategy="epoch",   # DÜZELTİLDİ — eski 'evaluation_strategy' yerine
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="f1",
+    greater_is_better=True,
+    fp16=use_fp16,
+    report_to=[]
+)
 
-def run_phase_23_hparam():
-    """
-    Phase 2.3 — Hyperparameter Optimisation
-    - To be implemented: grid/Bayesian search over LR, batch size, max_len, epochs
-    """
-    raise NotImplementedError("Phase 2.3 not implemented yet.")
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics
+)
 
 # -----------------------------
-# Main
+# 7) Fine-tuning
 # -----------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--phase", type=str, default="2.0", help="Which Phase 2 step to run: 2.0 | 2.1 | 2.2 | 2.3")
-    args = parser.parse_args()
+trainer.train()
 
-    if args.phase == "2.0":
-        run_phase_20_baseline()
-    elif args.phase == "2.1":
-        run_phase_21_finetune()
-    elif args.phase == "2.2":
-        run_phase_22_kfold()
-    elif args.phase == "2.3":
-        run_phase_23_hparam()
-    else:
-        raise ValueError("Unknown phase argument. Use one of: 2.0 | 2.1 | 2.2 | 2.3")
+# -----------------------------
+# 8) Test değerlendirme
+# -----------------------------
+test_metrics = trainer.evaluate(test_ds)
+print("[Phase 2.1] Test metrics:", test_metrics)
+pd.DataFrame([test_metrics]).to_csv(OUT_DIR / "metrics_test_overall.csv", index=False)
+
+# Sınıf bazlı rapor & karışıklık matrisi
+pred_outputs = trainer.predict(test_ds)
+test_preds = np.argmax(pred_outputs.predictions, axis=1)
+test_probs = torch.softmax(torch.tensor(pred_outputs.predictions), dim=1).numpy()
+
+cm = confusion_matrix(y_test, test_preds, labels=[0,1,2])
+pd.DataFrame(cm, index=[id2label[i] for i in [0,1,2]],
+             columns=[id2label[i] for i in [0,1,2]]).to_csv(OUT_DIR / "confusion_matrix.csv")
+
+rep = classification_report(y_test, test_preds, target_names=[id2label[i] for i in [0,1,2]], output_dict=True, zero_division=0)
+pd.DataFrame(rep).transpose().to_csv(OUT_DIR / "classification_report.csv")
+
+pred_df = pd.DataFrame({
+    "text": list(X_test),
+    "gold": [id2label[i] for i in y_test],
+    "pred": [id2label[i] for i in test_preds],
+    "prob_positive": test_probs[:,0],
+    "prob_neutral":  test_probs[:,1],
+    "prob_negative": test_probs[:,2],
+})
+pred_df.to_csv(OUT_DIR / "predictions_test.csv", index=False)
+
+# Görsel
+plt.figure(figsize=(5,4))
+plt.imshow(cm, interpolation='nearest')
+plt.title("Confusion Matrix – Phase 2.1")
+plt.xlabel("Predicted"); plt.ylabel("True")
+plt.xticks([0,1,2], [id2label[i] for i in [0,1,2]])
+plt.yticks([0,1,2], [id2label[i] for i in [0,1,2]])
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        plt.text(j, i, cm[i, j], ha="center", va="center")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "confusion_matrix.png", dpi=200)
+plt.close()
+
+print(f"[Phase 2.1] Done. Outputs saved under: {OUT_DIR}")
